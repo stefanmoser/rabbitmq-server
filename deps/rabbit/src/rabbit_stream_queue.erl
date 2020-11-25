@@ -45,7 +45,7 @@
 -export([format_osiris_event/2]).
 -export([update_stream_conf/1]).
 
--include("rabbit.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
 -include("amqqueue.hrl").
 
 -define(INFO_KEYS, [name, durable, auto_delete, arguments, leader, members, online, state,

@@ -66,3 +66,5 @@ rabbitmq-server-*.tar.gz
 rabbitmq-server-*.tar.bz2
 rabbitmq-server-*.tar.xz
 rabbitmq-server-*.zip
+
+/bazel-*
