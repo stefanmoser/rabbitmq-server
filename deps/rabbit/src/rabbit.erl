@@ -7,6 +7,9 @@
 
 -module(rabbit).
 
+-include_lib("kernel/include/logger.hrl").
+-include_lib("rabbitmq_prelaunch/include/logging.hrl").
+
 %% Transitional step until we can require Erlang/OTP 21 and
 %% use the now recommended try/catch syntax for obtaining the stack trace.
 -compile(nowarn_deprecated_function).
@@ -261,7 +264,7 @@
 
 -rabbit_boot_step({networking,
                    [{description, "TCP and TLS listeners (backwards compatibility)"},
-                    {mfa,         {rabbit_log, debug, ["'networking' boot step skipped and moved to end of startup", []]}},
+                    {mfa,         {logger, debug, ["'networking' boot step skipped and moved to end of startup", [], #{domain => ?LOGGER_DOMAIN_GLOBAL}]}},
                     {requires,    notify_cluster}]}).
 
 %%---------------------------------------------------------------------------
@@ -335,12 +338,12 @@ run_prelaunch_second_phase() ->
 
     case IsInitialPass of
         true ->
-            rabbit_log_prelaunch:debug(""),
-            rabbit_log_prelaunch:debug(
+            ?LOG_DEBUG(""),
+            ?LOG_DEBUG(
               "== Prelaunch phase [2/2] (initial pass) ==");
         false ->
-            rabbit_log_prelaunch:debug(""),
-            rabbit_log_prelaunch:debug("== Prelaunch phase [2/2] =="),
+            ?LOG_DEBUG(""),
+            ?LOG_DEBUG("== Prelaunch phase [2/2] =="),
             ok
     end,
 
@@ -357,11 +360,11 @@ run_prelaunch_second_phase() ->
     ok = rabbit_prelaunch_cluster:setup(Context),
 
     %% Start Mnesia now that everything is ready.
-    rabbit_log_prelaunch:debug("Starting Mnesia"),
+    ?LOG_DEBUG("Starting Mnesia"),
     ok = mnesia:start(),
 
-    rabbit_log_prelaunch:debug(""),
-    rabbit_log_prelaunch:debug("== Prelaunch DONE =="),
+    ?LOG_DEBUG(""),
+    ?LOG_DEBUG("== Prelaunch DONE =="),
 
     case IsInitialPass of
         true  -> rabbit_prelaunch:initial_pass_finished();
@@ -373,7 +376,8 @@ start_it(StartType) ->
     case spawn_boot_marker() of
         {ok, Marker} ->
             T0 = erlang:timestamp(),
-            rabbit_log:info("RabbitMQ is asked to start...", []),
+            ?LOG_INFO("RabbitMQ is asked to start...", [],
+                      #{domain => ?LOGGER_DOMAIN_PRELAUNCH}),
             try
                 {ok, _} = application:ensure_all_started(rabbitmq_prelaunch,
                                                          StartType),
@@ -382,7 +386,7 @@ start_it(StartType) ->
                 ok = wait_for_ready_or_stopped(),
 
                 T1 = erlang:timestamp(),
-                rabbit_log_prelaunch:debug(
+                ?LOG_DEBUG(
                   "Time to start RabbitMQ: ~p µs",
                   [timer:now_diff(T1, T0)]),
                 stop_boot_marker(Marker),
@@ -433,11 +437,13 @@ stop() ->
             case rabbit_boot_state:get() of
                 ready ->
                     Product = product_name(),
-                    rabbit_log:info("~s is asked to stop...", [Product]),
+                    ?LOG_INFO("~s is asked to stop...", [Product],
+                              #{domain => ?LOGGER_DOMAIN_PRELAUNCH}),
                     do_stop(),
-                    rabbit_log:info(
+                    ?LOG_INFO(
                       "Successfully stopped ~s and its dependencies",
-                      [Product]),
+                      [Product],
+                      #{domain => ?LOGGER_DOMAIN_PRELAUNCH}),
                     ok;
                 stopped ->
                     ok
@@ -461,19 +467,22 @@ stop_and_halt() ->
     try
         stop()
     catch Type:Reason ->
-        rabbit_log:error(
+        ?LOG_ERROR(
           "Error trying to stop ~s: ~p:~p",
-          [product_name(), Type, Reason]),
+          [product_name(), Type, Reason],
+          #{domain => ?LOGGER_DOMAIN_PRELAUNCH}),
         error({Type, Reason})
     after
         %% Enclose all the logging in the try block.
         %% init:stop() will be called regardless of any errors.
         try
             AppsLeft = [ A || {A, _, _} <- application:which_applications() ],
-            rabbit_log:info(
-                lists:flatten(["Halting Erlang VM with the following applications:~n",
-                               ["    ~p~n" || _ <- AppsLeft]]),
-                AppsLeft),
+            ?LOG_ERROR(
+                lists:flatten(
+                  ["Halting Erlang VM with the following applications:~n",
+                   ["    ~p~n" || _ <- AppsLeft]]),
+                AppsLeft,
+                #{domain => ?LOGGER_DOMAIN_GLOBAL}),
             %% Also duplicate this information to stderr, so console where
             %% foreground broker was running (or systemd journal) will
             %% contain information about graceful termination.
@@ -518,10 +527,12 @@ start_apps(Apps, RestartTypes) ->
 stop_apps([]) ->
     ok;
 stop_apps(Apps) ->
-    rabbit_log:info(
-        lists:flatten(["Stopping ~s applications and their dependencies in the following order:~n",
-                       ["    ~p~n" || _ <- Apps]]),
-        [product_name() | lists:reverse(Apps)]),
+    ?LOG_INFO(
+        lists:flatten(
+          ["Stopping ~s applications and their dependencies in the following order:~n",
+           ["    ~p~n" || _ <- Apps]]),
+        [product_name() | lists:reverse(Apps)],
+        #{domain => ?LOGGER_DOMAIN_PRELAUNCH}),
     ok = app_utils:stop_applications(
            Apps, handle_app_error(error_during_shutdown)),
     case lists:member(rabbit, Apps) of
@@ -835,14 +846,18 @@ start(normal, []) ->
             #{product_overridden := true,
               product_base_name := BaseName,
               product_base_version := BaseVersion} ->
-                rabbit_log:info("~n Starting ~s ~s on Erlang ~s~n Based on ~s ~s~n ~s~n ~s~n",
-                                [product_name(), product_version(), rabbit_misc:otp_release(),
-                                 BaseName, BaseVersion,
-                                 ?COPYRIGHT_MESSAGE, ?INFORMATION_MESSAGE]);
+                ?LOG_INFO(
+                   "~n Starting ~s ~s on Erlang ~s~n Based on ~s ~s~n ~s~n ~s~n",
+                   [product_name(), product_version(), rabbit_misc:otp_release(),
+                    BaseName, BaseVersion,
+                    ?COPYRIGHT_MESSAGE, ?INFORMATION_MESSAGE],
+                   #{domain => ?LOGGER_DOMAIN_PRELAUNCH});
             _ ->
-                rabbit_log:info("~n Starting ~s ~s on Erlang ~s~n ~s~n ~s~n",
-                                [product_name(), product_version(), rabbit_misc:otp_release(),
-                                 ?COPYRIGHT_MESSAGE, ?INFORMATION_MESSAGE])
+                ?LOG_INFO(
+                   "~n Starting ~s ~s on Erlang ~s~n ~s~n ~s~n",
+                   [product_name(), product_version(), rabbit_misc:otp_release(),
+                    ?COPYRIGHT_MESSAGE, ?INFORMATION_MESSAGE],
+                   #{domain => ?LOGGER_DOMAIN_PRELAUNCH})
         end,
         log_motd(),
         {ok, SupPid} = rabbit_sup:start_link(),
@@ -860,7 +875,7 @@ start(normal, []) ->
         %%
         %% Note that plugins were not taken care of at this point
         %% either.
-        rabbit_log_prelaunch:debug(
+        ?LOG_DEBUG(
           "Register `rabbit` process (~p) for rabbit_node_monitor",
           [self()]),
         true = register(rabbit, self()),
@@ -870,15 +885,15 @@ start(normal, []) ->
         warn_if_kernel_config_dubious(),
         warn_if_disc_io_options_dubious(),
 
-        rabbit_log_prelaunch:debug(""),
-        rabbit_log_prelaunch:debug("== Plugins (prelaunch phase) =="),
+        ?LOG_DEBUG(""),
+        ?LOG_DEBUG("== Plugins (prelaunch phase) =="),
 
-        rabbit_log_prelaunch:debug("Setting plugins up"),
+        ?LOG_DEBUG("Setting plugins up"),
         %% `Plugins` contains all the enabled plugins, plus their
         %% dependencies. The order is important: dependencies appear
         %% before plugin which depend on them.
         Plugins = rabbit_plugins:setup(),
-        rabbit_log_prelaunch:debug(
+        ?LOG_DEBUG(
           "Loading the following plugins: ~p", [Plugins]),
         %% We can load all plugins and refresh their feature flags at
         %% once, because it does not involve running code from the
@@ -887,8 +902,8 @@ start(normal, []) ->
         ok = rabbit_feature_flags:refresh_feature_flags_after_app_load(
                Plugins),
 
-        rabbit_log_prelaunch:debug(""),
-        rabbit_log_prelaunch:debug("== Boot steps =="),
+        ?LOG_DEBUG(""),
+        ?LOG_DEBUG("== Boot steps =="),
 
         ok = rabbit_boot_steps:run_boot_steps([rabbit | Plugins]),
         run_postlaunch_phase(Plugins),
@@ -917,23 +932,22 @@ run_postlaunch_phase(Plugins) ->
 do_run_postlaunch_phase(Plugins) ->
     %% Once RabbitMQ itself is started, we need to run a few more steps,
     %% in particular start plugins.
-    rabbit_log_prelaunch:debug(""),
-    rabbit_log_prelaunch:debug("== Postlaunch phase =="),
+    ?LOG_DEBUG(""),
+    ?LOG_DEBUG("== Postlaunch phase =="),
 
     try
         %% Successful boot resets node maintenance state.
-        rabbit_log_prelaunch:debug(""),
-        rabbit_log_prelaunch:info("Resetting node maintenance status"),
+        ?LOG_DEBUG(""),
+        ?LOG_INFO("Resetting node maintenance status"),
         _ = rabbit_maintenance:unmark_as_being_drained(),
 
-        rabbit_log_prelaunch:debug(""),
-        rabbit_log_prelaunch:debug("== Plugins (postlaunch phase) =="),
+        ?LOG_DEBUG(""),
+        ?LOG_DEBUG("== Plugins (postlaunch phase) =="),
 
         %% However, we want to run their boot steps and actually start
         %% them one by one, to ensure a dependency is fully started
         %% before a plugin which depends on it gets a chance to start.
-        rabbit_log_prelaunch:debug(
-          "Starting the following plugins: ~p", [Plugins]),
+        ?LOG_DEBUG("Starting the following plugins: ~p", [Plugins]),
         lists:foreach(
           fun(Plugin) ->
                   case application:ensure_all_started(Plugin) of
@@ -951,18 +965,17 @@ do_run_postlaunch_phase(Plugins) ->
 
         %% Start listeners after all plugins have been enabled,
         %% see rabbitmq/rabbitmq-server#2405.
-        rabbit_log_prelaunch:info(
-          "Ready to start client connection listeners"),
+        ?LOG_INFO("Ready to start client connection listeners"),
         ok = rabbit_networking:boot(),
 
         %% The node is ready: mark it as such and log it.
         %% NOTE: PLEASE DO NOT ADD CRITICAL NODE STARTUP CODE AFTER THIS.
-        ok = rabbit_lager:broker_is_started(),
+        % XXX ok = rabbit_lager:broker_is_started(),
         ActivePlugins = rabbit_plugins:active(),
         StrictlyPlugins = rabbit_plugins:strictly_plugins(ActivePlugins),
         ok = log_broker_started(StrictlyPlugins),
 
-        rabbit_log_prelaunch:debug("Marking ~s as running", [product_name()]),
+        ?LOG_DEBUG("Marking ~s as running", [product_name()]),
         rabbit_boot_state:set(ready)
     catch
         throw:{error, _} = Error ->
@@ -1019,10 +1032,12 @@ maybe_insert_default_data() ->
     NoDefsToImport = not rabbit_definitions:has_configured_definitions_to_load(),
     case rabbit_table:needs_default_data() andalso NoDefsToImport of
         true  ->
-            rabbit_log:info("Will seed default virtual host and user..."),
+            ?LOG_INFO("Will seed default virtual host and user...",
+                      #{domain => ?LOGGER_DOMAIN_GLOBAL}),
             insert_default_data();
         false ->
-            rabbit_log:info("Will not seed default virtual host and user: have definitions to load..."),
+            ?LOG_INFO("Will not seed default virtual host and user: have definitions to load...",
+                      #{domain => ?LOGGER_DOMAIN_GLOBAL}),
             ok
     end.
 
@@ -1063,7 +1078,8 @@ insert_default_data() ->
 
 -spec log_locations() -> [rabbit_lager:log_location()].
 log_locations() ->
-    rabbit_lager:log_locations().
+    % XXX rabbit_lager:log_locations().
+    [].
 
 -spec config_locations() -> [rabbit_config:config_location()].
 config_locations() ->
@@ -1094,7 +1110,8 @@ log_broker_started(Plugins) ->
     Message = string:strip(rabbit_misc:format(
         "Server startup complete; ~b plugins started.~n~s",
         [length(Plugins), PluginList]), right, $\n),
-    rabbit_log:info(Message),
+    ?LOG_INFO(Message,
+              #{domain => ?LOGGER_DOMAIN_GLOBAL}),
     io:format(" completed with ~p plugins.~n", [length(Plugins)]).
 
 -define(RABBIT_TEXT_LOGO,
@@ -1185,7 +1202,8 @@ log_motd() ->
                           _    -> [" ", Line, "\n"]
                       end
                       || Line <- Lines],
-            rabbit_log:info("~n~ts", [string:trim(Padded, trailing, [$\r, $\n])])
+            ?LOG_INFO("~n~ts", [string:trim(Padded, trailing, [$\r, $\n])],
+                      #{domain => ?LOGGER_DOMAIN_GLOBAL})
     end.
 
 log_banner() ->
@@ -1216,7 +1234,8 @@ log_banner() ->
                     {K, V} ->
                         Format(K, V)
                 end || S <- Settings]), right, $\n),
-    rabbit_log:info("~n~ts", [Banner]).
+    ?LOG_INFO("~n~ts", [Banner],
+              #{domain => ?LOGGER_DOMAIN_GLOBAL}).
 
 warn_if_kernel_config_dubious() ->
     case os:type() of
@@ -1225,16 +1244,18 @@ warn_if_kernel_config_dubious() ->
         _ ->
             case erlang:system_info(kernel_poll) of
                 true  -> ok;
-                false -> rabbit_log:warning(
-                           "Kernel poll (epoll, kqueue, etc) is disabled. Throughput "
-                           "and CPU utilization may worsen.~n")
+                false -> ?LOG_WARNING(
+                           "Kernel poll (epoll, kqueue, etc) is disabled. "
+                           "Throughput and CPU utilization may worsen.~n",
+                           #{domain => ?LOGGER_DOMAIN_GLOBAL})
             end
     end,
     AsyncThreads = erlang:system_info(thread_pool_size),
     case AsyncThreads < ?ASYNC_THREADS_WARNING_THRESHOLD of
-        true  -> rabbit_log:warning(
+        true  -> ?LOG_WARNING(
                    "Erlang VM is running with ~b I/O threads, "
-                   "file I/O performance may worsen~n", [AsyncThreads]);
+                   "file I/O performance may worsen~n", [AsyncThreads],
+                   #{domain => ?LOGGER_DOMAIN_GLOBAL});
         false -> ok
     end,
     IDCOpts = case application:get_env(kernel, inet_default_connect_options) of
@@ -1242,8 +1263,9 @@ warn_if_kernel_config_dubious() ->
                   {ok, Val} -> Val
               end,
     case proplists:get_value(nodelay, IDCOpts, false) of
-        false -> rabbit_log:warning("Nagle's algorithm is enabled for sockets, "
-                                    "network I/O latency will be higher~n");
+        false -> ?LOG_WARNING("Nagle's algorithm is enabled for sockets, "
+                              "network I/O latency will be higher~n",
+                              #{domain => ?LOGGER_DOMAIN_GLOBAL});
         true  -> ok
     end.
 
@@ -1259,7 +1281,8 @@ warn_if_disc_io_options_dubious() ->
                  CreditDiscBound, IoBatchSize) of
         ok -> ok;
         {error, {Reason, Vars}} ->
-            rabbit_log:warning(Reason, Vars)
+            ?LOG_WARNING(Reason, Vars,
+                         #{domain => ?LOGGER_DOMAIN_GLOBAL})
     end.
 
 validate_msg_store_io_batch_size_and_credit_disc_bound(CreditDiscBound,
@@ -1498,8 +1521,10 @@ ensure_working_fhc() ->
             {ok, true}  -> "ON";
             {ok, false} -> "OFF"
         end,
-        rabbit_log:info("FHC read buffering:  ~s~n", [ReadBuf]),
-        rabbit_log:info("FHC write buffering: ~s~n", [WriteBuf]),
+        ?LOG_INFO("FHC read buffering:  ~s~n", [ReadBuf],
+                  #{domain => ?LOGGER_DOMAIN_GLOBAL}),
+        ?LOG_INFO("FHC write buffering: ~s~n", [WriteBuf],
+                  #{domain => ?LOGGER_DOMAIN_GLOBAL}),
         Filename = filename:join(code:lib_dir(kernel, ebin), "kernel.app"),
         {ok, Fd} = file_handle_cache:open(Filename, [raw, binary, read], []),
         {ok, _} = file_handle_cache:read(Fd, 1),

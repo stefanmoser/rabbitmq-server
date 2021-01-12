@@ -7,69 +7,83 @@
 
 -module(rabbit_prelaunch_logging).
 
+-include_lib("kernel/include/logger.hrl").
+-include_lib("rabbitmq_prelaunch/include/logging.hrl").
+
 -export([setup/1]).
 
 setup(Context) ->
-    rabbit_log_prelaunch:debug(""),
-    rabbit_log_prelaunch:debug("== Logging =="),
+    ?LOG_DEBUG(""),
+    ?LOG_DEBUG("== Logging =="),
     ok = set_ERL_CRASH_DUMP_envvar(Context),
-    ok = configure_lager(Context).
+    ok = configure_logger(Context),
+    ok.
 
 set_ERL_CRASH_DUMP_envvar(#{log_base_dir := LogBaseDir}) ->
     case os:getenv("ERL_CRASH_DUMP") of
         false ->
             ErlCrashDump = filename:join(LogBaseDir, "erl_crash.dump"),
-            rabbit_log_prelaunch:debug(
+            ?LOG_DEBUG(
               "Setting $ERL_CRASH_DUMP environment variable to \"~ts\"",
               [ErlCrashDump]),
             os:putenv("ERL_CRASH_DUMP", ErlCrashDump),
             ok;
         ErlCrashDump ->
-            rabbit_log_prelaunch:debug(
+            ?LOG_DEBUG(
               "$ERL_CRASH_DUMP environment variable already set to \"~ts\"",
               [ErlCrashDump]),
             ok
     end.
 
-configure_lager(#{log_base_dir := LogBaseDir,
-                  main_log_file := MainLog,
-                  upgrade_log_file := UpgradeLog} = Context) ->
-    {SaslErrorLogger,
-     MainLagerHandler,
-     UpgradeLagerHandler} = case MainLog of
-                                "-" ->
-                                    %% Log to STDOUT.
-                                    rabbit_log_prelaunch:debug(
-                                      "Logging to stdout"),
-                                    {tty,
-                                     tty,
-                                     tty};
-                                _ ->
-                                    rabbit_log_prelaunch:debug(
-                                      "Logging to:"),
-                                    [rabbit_log_prelaunch:debug(
-                                       "  - ~ts", [Log])
-                                     || Log <- [MainLog, UpgradeLog]],
-                                    %% Log to file.
-                                    {false,
-                                     MainLog,
-                                     UpgradeLog}
-                            end,
+configure_logger(#{main_log_file := MainLog,
+                   upgrade_log_file := UpgradeLog}) ->
+    {MainHandler,
+     UpgradeHandler} = case MainLog of
+                           "-" ->
+                               %% Log to STDOUT.
+                               ?LOG_DEBUG("Logging to stdout"),
+                               {tty,
+                                tty};
+                           _ ->
+                               ?LOG_DEBUG("Logging to:"),
+                               [?LOG_DEBUG("  - ~ts", [Log])
+                                || Log <- [MainLog, UpgradeLog]],
+                               %% Log to file.
+                               {MainLog,
+                                UpgradeLog}
+                       end,
+    ok = configure_main_log(MainHandler),
+    ok = configure_upgrade_log(UpgradeHandler),
+    ok.
 
-    ok = application:set_env(lager, crash_log, "log/crash.log"),
+configure_main_log(tty) ->
+    %% Already the default.
+    ok;
+configure_main_log(Filename) ->
+    Config0 = main_handler_config(),
+    Config = Config0#{config => #{file => Filename}},
+    ok = logger:add_handler(main_log_file, logger_std_h, Config),
 
-    Fun = fun({App, Var, Value}) ->
-                  case application:get_env(App, Var) of
-                      undefined -> ok = application:set_env(App, Var, Value);
-                      _         -> ok
-                  end
-          end,
-    Vars = [{sasl, sasl_error_logger, SaslErrorLogger},
-            {rabbit, lager_log_root, LogBaseDir},
-            {rabbit, lager_default_file, MainLagerHandler},
-            {rabbit, lager_upgrade_file, UpgradeLagerHandler}],
-    lists:foreach(Fun, Vars),
+    Filter = {fun logger_filters:domain/2,
+              {stop, sub, ?LOGGER_DOMAIN_UPGRADE}},
+    ok = logger:add_handler_filter(main_log_file, no_upgrade, Filter),
+    ok = logger:remove_handler(default).
 
-    ok = rabbit_lager:start_logger(),
+configure_upgrade_log(tty) ->
+    %% Already the default.
+    ok;
+configure_upgrade_log(Filename) ->
+    Config0 = upgrade_handler_config(),
+    Config = Config0#{config => #{file => Filename}},
+    ok = logger:add_handler(upgrade_log_file, logger_std_h, Config),
 
-    ok = rabbit_prelaunch_early_logging:setup_early_logging(Context, false).
+    Filter = {fun logger_filters:domain/2,
+              {log, sub, ?LOGGER_DOMAIN_UPGRADE}},
+    ok = logger:add_handler_filter(upgrade_log_file, no_upgrade, Filter).
+
+main_handler_config() ->
+    rabbit_prelaunch_early_logging:main_handler_config().
+
+upgrade_handler_config() ->
+    Config = rabbit_prelaunch_early_logging:main_handler_config(),
+    Config#{filter_default => stop}.

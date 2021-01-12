@@ -8,6 +8,7 @@
 -module(rabbit_env).
 
 -include_lib("kernel/include/file.hrl").
+-include_lib("kernel/include/logger.hrl").
 
 -export([get_context/0,
          get_context/1,
@@ -216,18 +217,18 @@ get_used_env_vars() ->
       lists:sort(os:list_env_vars())).
 
 log_process_env() ->
-    rabbit_log_prelaunch:debug("Process environment:"),
+    ?LOG_DEBUG("Process environment:"),
     lists:foreach(
       fun({Var, Value}) ->
-              rabbit_log_prelaunch:debug("  - ~s = ~ts", [Var, Value])
+              ?LOG_DEBUG("  - ~s = ~ts", [Var, Value])
       end, lists:sort(os:list_env_vars())).
 
 log_context(Context) ->
-    rabbit_log_prelaunch:debug("Context (based on environment variables):"),
+    ?LOG_DEBUG("Context (based on environment variables):"),
     lists:foreach(
       fun(Key) ->
               Value = maps:get(Key, Context),
-              rabbit_log_prelaunch:debug("  - ~s: ~p", [Key, Value])
+              ?LOG_DEBUG("  - ~s: ~p", [Key, Value])
       end,
       lists:sort(maps:keys(Context))).
 

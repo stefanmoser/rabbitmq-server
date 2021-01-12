@@ -18,6 +18,9 @@
 
 -export_type([log_location/0]).
 
+% XXX
+-export([lager_configured/0]).
+
 -type log_location() :: string().
 
 start_logger() ->
@@ -194,10 +197,11 @@ ensure_logfile_exist(FileName) ->
     end.
 
 ensure_lager_configured() ->
-    case lager_configured() of
-        false -> configure_lager();
-        true -> ok
-    end.
+    ok.
+% XXX     case lager_configured() of
+% XXX         false -> configure_lager();
+% XXX         true -> ok
+% XXX     end.
 
 %% Lager should have handlers and sinks
 %% Error logger forwarding to syslog should be disabled

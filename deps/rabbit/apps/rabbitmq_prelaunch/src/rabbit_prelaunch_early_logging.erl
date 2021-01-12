@@ -1,60 +1,69 @@
 -module(rabbit_prelaunch_early_logging).
 
--include_lib("rabbit_common/include/rabbit_log.hrl").
+-include_lib("kernel/include/logger.hrl").
+
+-include("include/logging.hrl").
 
 -export([setup_early_logging/2,
+         main_handler_config/0,
          enable_quick_dbg/1,
          use_colored_logging/0,
-         use_colored_logging/1,
-         list_expected_sinks/0]).
+         use_colored_logging/1]).
 
 setup_early_logging(#{log_levels := undefined} = Context,
-                         LagerEventToStdout) ->
+                    LagerEventToStdout) ->
     setup_early_logging(Context#{log_levels => get_default_log_level()},
-                             LagerEventToStdout);
+                        LagerEventToStdout);
 setup_early_logging(Context, LagerEventToStdout) ->
-    Configured = lists:member(
-                   lager_util:make_internal_sink_name(rabbit_log_prelaunch),
-                   lager:list_all_sinks()),
+    Configured = is_primary_filter_defined(),
     case Configured of
         true  -> ok;
         false -> do_setup_early_logging(Context, LagerEventToStdout)
     end.
 
 get_default_log_level() ->
-    #{"prelaunch" => warning}.
+    #{"prelaunch" => notice}.
 
-do_setup_early_logging(#{log_levels := LogLevels} = Context,
-                       LagerEventToStdout) ->
-    redirect_logger_messages_to_lager(),
-    Colored = use_colored_logging(Context),
-    application:set_env(lager, colored, Colored),
-    ConsoleBackend = lager_console_backend,
-    case LagerEventToStdout of
-        true ->
-            GLogLevel = case LogLevels of
-                            #{global := Level} -> Level;
-                            _                  -> warning
-                        end,
-            _ = lager_app:start_handler(
-                  lager_event, ConsoleBackend, [{level, GLogLevel}]),
-            ok;
-        false ->
-            ok
-    end,
-    lists:foreach(
-      fun(Sink) ->
-              CLogLevel = get_log_level(LogLevels, Sink),
-              lager_app:configure_sink(
-                Sink,
-                [{handlers, [{ConsoleBackend, [{level, CLogLevel}]}]}])
-      end, list_expected_sinks()),
-    ok.
+do_setup_early_logging(#{log_levels := LogLevels},
+                       _LagerEventToStdout) ->
+    add_primary_filter(LogLevels),
+    ok = logger:update_handler_config(default, main_handler_config()).
 
-redirect_logger_messages_to_lager() ->
-    io:format(standard_error, "Configuring logger redirection~n", []),
-    ok = logger:add_handler(rabbit_log, rabbit_log, #{}),
+is_primary_filter_defined() ->
+    #{filters := Filters} = logger:get_primary_config(),
+    lists:keymember(rabbitmq_levels_and_categories, 1, Filters).
+
+add_primary_filter(LogLevels) ->
+    ok = logger:add_primary_filter(
+           rabbitmq_levels_and_categories,
+           {primary_logger_filter(LogLevels), #{}}),
     ok = logger:set_primary_config(level, all).
+
+primary_logger_filter(LogLevels) ->
+    fun(#{level := Level, meta := Meta} = LogEvent, _) ->
+            GlobalMinLevel = maps:get(global, LogLevels, notice),
+            case Meta of
+                #{domain := [?LOGGER_SUPER_DOMAIN_NAME, Domain | _]} ->
+                    MinLevel = maps:get(atom_to_list(Domain),
+                                        LogLevels,
+                                        GlobalMinLevel),
+                    case logger:compare_levels(Level, MinLevel) of
+                        lt -> stop;
+                        _  -> LogEvent
+                    end;
+                _ ->
+                    case logger:compare_levels(Level, GlobalMinLevel) of
+                        lt -> stop;
+                        _  -> LogEvent
+                    end
+            end
+    end.
+
+main_handler_config() ->
+    #{filter_default => log,
+      formatter => {logger_formatter, #{legacy_header => false,
+                                        single_line => true}}
+     }.
 
 use_colored_logging() ->
     use_colored_logging(rabbit_prelaunch:get_context()).
@@ -64,45 +73,6 @@ use_colored_logging(#{log_levels := #{color := true},
     true;
 use_colored_logging(_) ->
     false.
-
-list_expected_sinks() ->
-    Key = {?MODULE, lager_extra_sinks},
-    case persistent_term:get(Key, undefined) of
-        undefined ->
-            CompileOptions = proplists:get_value(options,
-                                                 module_info(compile),
-                                                 []),
-            AutoList = [lager_util:make_internal_sink_name(M)
-                        || M <- proplists:get_value(lager_extra_sinks,
-                                                    CompileOptions, [])],
-            List = case lists:member(?LAGER_SINK, AutoList) of
-                true  -> AutoList;
-                false -> [?LAGER_SINK | AutoList]
-            end,
-            %% Store the list in the application environment. If this
-            %% module is later cover-compiled, the compile option will
-            %% be lost, so we will be able to retrieve the list from the
-            %% application environment.
-            persistent_term:put(Key, List),
-            List;
-        List ->
-            List
-    end.
-
-sink_to_category(Sink) when is_atom(Sink) ->
-    re:replace(
-      atom_to_list(Sink),
-      "^rabbit_log_(.+)_lager_event$",
-      "\\1",
-      [{return, list}]).
-
-get_log_level(LogLevels, Sink) ->
-    Category = sink_to_category(Sink),
-    case LogLevels of
-        #{Category := Level} -> Level;
-        #{global := Level}   -> Level;
-        _                    -> warning
-    end.
 
 enable_quick_dbg(#{dbg_output := Output, dbg_mods := Mods}) ->
     case Output of
