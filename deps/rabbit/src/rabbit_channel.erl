@@ -479,6 +479,7 @@ update_user_state(Pid, UserState) when is_pid(Pid) ->
 
 init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, Protocol, User, VHost,
       Capabilities, CollectorPid, LimiterPid, AmqpParams]) ->
+    rabbit_log:warning("INIT CHANNEL ~n", []),
     process_flag(trap_exit, true),
     ?LG_PROCESS_TYPE(channel),
     ?store_proc_name({ConnName, Channel}),
@@ -1291,6 +1292,7 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
             true  -> SeqNo = State#ch.publish_seqno,
                      {SeqNo, State#ch{publish_seqno = SeqNo + 1}}
         end,
+    rabbit_log:warning("PUBLISHING MSG ~p", [MsgSeqNo]),
     case rabbit_basic:message(ExchangeName, RoutingKey, DecodedContent) of
         {ok, Message} ->
             Delivery = rabbit_basic:delivery(
@@ -1432,6 +1434,7 @@ handle_method(#'basic.consume'{queue        = QueueNameBin,
                                          authz_context = AuthzContext},
                              consumer_mapping  = ConsumerMapping
                             }) ->
+    rabbit_log:warning("BASIC.CONSUME", []),
     case maps:find(ConsumerTag, ConsumerMapping) of
         error ->
             QueueName = qbin_to_resource(QueueNameBin, VHostPath),
@@ -2154,6 +2157,7 @@ confirm(MsgSeqNos, QRef, State = #ch{unconfirmed = UC}) ->
     %% does not exist in unconfirmed messages.
     %% Neither does the 'ignore' atom, so it's a reasonable fallback.
     {ConfirmMXs, UC1} = rabbit_confirms:confirm(MsgSeqNos, QRef, UC),
+    rabbit_log:warning("Confirming ~p ~p", [MsgSeqNos, ConfirmMXs]),
     %% NB: don't call noreply/1 since we don't want to send confirms.
     record_confirms(ConfirmMXs, State#ch{unconfirmed = UC1}).
 
@@ -2172,6 +2176,7 @@ send_confirms_and_nacks(State = #ch{tx = none, confirmed = C, rejected = R}) ->
                     end, [], Confirms),
             RejectMsgSeqNos = [MsgSeqNo || {MsgSeqNo, _} <- Rejects],
 
+            rabbit_log:warning("SEND CONFIRMS ~p", [ConfirmMsgSeqNos]),
             State1 = send_confirms(ConfirmMsgSeqNos,
                                    RejectMsgSeqNos,
                                    State#ch{confirmed = []}),

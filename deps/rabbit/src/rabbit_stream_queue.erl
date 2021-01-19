@@ -59,9 +59,13 @@
                  max :: non_neg_integer(),
                  start_offset = 0 :: non_neg_integer(),
                  listening_offset = 0 :: non_neg_integer(),
-                 log :: undefined | osiris_log:state()}).
+                 log :: undefined | osiris_log:state(),
+                 competing :: boolean(),
+                 pending_chunks = [] :: [non_neg_integer()]
+                }).
 
--record(stream_client, {name :: term(),
+-record(stream_client, {name :: binary(),
+                        reference :: term(),
                         leader :: pid(),
                         next_seq = 1 :: non_neg_integer(),
                         correlation = #{} :: #{appender_seq() => term()},
@@ -103,7 +107,7 @@ start_cluster(Q0, Node) ->
            amqqueue:set_type_state(Q0, Conf0)) of
         {ok, {error, already_started}, _} ->
             {protocol_error, precondition_failed, "safe queue name already in use '~s'",
-             [Node]};
+             [maps:get(name, Conf0)]};
         {ok, {created, Q}, _} ->
             rabbit_event:notify(queue_created,
                                 [{name, QName},
@@ -187,6 +191,13 @@ consume(Q, Spec, QState0) when ?amqqueue_is_stream(Q) ->
                          {_, V} ->
                              V
                      end,
+            %% If we have competing consumers, offset must be ignored
+            Competing = case rabbit_misc:table_lookup(Args, <<"x-competing-consumers">>) of
+                            undefined ->
+                                false;
+                            _ ->
+                                true
+                        end,
             rabbit_core_metrics:consumer_created(ChPid, ConsumerTag, ExclusiveConsume,
                                                  not NoAck, QName,
                                                  ConsumerPrefetchCount, false,
@@ -196,7 +207,7 @@ consume(Q, Spec, QState0) when ?amqqueue_is_stream(Q) ->
             %% do
             maybe_send_reply(ChPid, OkMsg),
             QState = begin_stream(QState0, Q, ConsumerTag, Offset,
-                                  ConsumerPrefetchCount),
+                                  ConsumerPrefetchCount, Competing),
             {ok, QState, []};
         Err ->
             Err
@@ -211,11 +222,25 @@ get_local_pid(#{replica_pids := ReplicaPids}) ->
     Local.
 
 begin_stream(#stream_client{readers = Readers0} = State,
-             Q, Tag, Offset, Max) ->
-    LocalPid = get_local_pid(amqqueue:get_type_state(Q)),
+             Q, Tag, Offset0, Max, Competing) ->
+    Conf = amqqueue:get_type_state(Q),
+    QName = amqqueue:get_name(Q),
+    LocalPid = get_local_pid(Conf),
+    Offset = case Competing of
+                 true -> 'first';
+                 false -> Offset0
+             end,
     {ok, Seg0} = osiris:init_reader(LocalPid, Offset),
     NextOffset = osiris_log:next_offset(Seg0) - 1,
-    osiris:register_offset_listener(LocalPid, NextOffset),
+    case Competing of
+        true ->
+            {ok, CRC} = osiris_server_sup:get_crc(maps:get(name, Conf)),
+            Fun = fun(Evt) -> {'$gen_cast', {queue_event, QName, Evt}} end,
+            %% TODO configure number of chunks
+            gen_server:call(CRC, {register, self(), Tag, 2, Fun});
+        false ->
+            osiris:register_offset_listener(LocalPid, NextOffset)
+    end,
     %% TODO: avoid double calls to the same process
     StartOffset = case Offset of
                       first -> NextOffset;
@@ -229,11 +254,12 @@ begin_stream(#stream_client{readers = Readers0} = State,
                    start_offset = StartOffset,
                    listening_offset = NextOffset,
                    log = Seg0,
-                   max = Max},
+                   max = Max,
+                   competing = Competing},
     State#stream_client{readers = Readers0#{Tag => Str0}}.
 
 cancel(_Q, ConsumerTag, OkMsg, ActingUser, #stream_client{readers = Readers0,
-                                                          name = QName} = State) ->
+                                                          reference = QName} = State) ->
     Readers = maps:remove(ConsumerTag, Readers0),
     rabbit_core_metrics:consumer_deleted(self(), ConsumerTag, QName),
     rabbit_event:notify(consumer_deleted, [{consumer_tag, ConsumerTag},
@@ -247,13 +273,20 @@ credit(CTag, Credit, Drain, #stream_client{readers = Readers0,
                                            name = Name,
                                            leader = Leader} = State) ->
     {Readers1, Msgs} = case Readers0 of
-                          #{CTag := #stream{credit = Credit0} = Str0} ->
-                              Str1 = Str0#stream{credit = Credit0 + Credit},
-                              {Str, Msgs0} = stream_entries(Name, Leader, Str1),
-                              {Readers0#{CTag => Str}, Msgs0};
-                          _ ->
-                              {Readers0, []}
-                      end,
+                           #{CTag := #stream{credit = Credit0,
+                                             competing = false} = Str0} ->
+                               Str1 = Str0#stream{credit = Credit0 + Credit},
+                               {Str, Msgs0} = stream_entries(Leader, Str1),
+                               {Readers0#{CTag => Str}, Msgs0};
+                           #{CTag := #stream{credit = Credit0,
+                                             competing = true} = Str0} ->
+                               Str1 = Str0#stream{credit = Credit0 + Credit},
+                               {ok, CRC} = osiris_server_sup:get_crc(Name),
+                               {Str, Msgs0} = stream_entries_by_chunks(CRC, CTag, Leader, Str1),
+                               {Readers0#{CTag => Str}, Msgs0};
+                           _ ->
+                               {Readers0, []}
+                       end,
     {Readers, Actions} =
         case Drain of
             true ->
@@ -283,7 +316,7 @@ deliver(QSs, #delivery{confirm = Confirm} = Delivery) ->
       end, {[], []}, QSs).
 
 deliver(_Confirm, #delivery{message = Msg, msg_seq_no = MsgId},
-       #stream_client{name = Name,
+       #stream_client{reference = Name,
                       leader = LeaderPid,
                       next_seq = Seq,
                       correlation = Correlation0,
@@ -307,14 +340,14 @@ deliver(_Confirm, #delivery{message = Msg, msg_seq_no = MsgId},
                         correlation = Correlation,
                         slow = Slow}.
 -spec dequeue(_, _, _, client()) -> no_return().
-dequeue(_, _, _, #stream_client{name = Name}) ->
+dequeue(_, _, _, #stream_client{reference = Name}) ->
     {protocol_error, not_implemented, "basic.get not supported by stream queues ~s",
      [rabbit_misc:rs(Name)]}.
 
 handle_event({osiris_written, From, _WriterId, Corrs}, State = #stream_client{correlation = Correlation0,
                                                    soft_limit = SftLmt,
                                                    slow = Slow0,
-                                                   name = Name}) ->
+                                                   reference = Name}) ->
     MsgIds = maps:values(maps:with(Corrs, Correlation0)),
     Correlation = maps:without(Corrs, Correlation0),
     Slow = case maps:size(Correlation) < SftLmt of
@@ -327,13 +360,12 @@ handle_event({osiris_written, From, _WriterId, Corrs}, State = #stream_client{co
     {ok, State#stream_client{correlation = Correlation,
                              slow = Slow}, [{settled, From, MsgIds}]};
 handle_event({osiris_offset, _From, _Offs}, State = #stream_client{leader = Leader,
-                                                                   readers = Readers0,
-                                                                   name = Name}) ->
+                                                                   readers = Readers0}) ->
     %% offset isn't actually needed as we use the atomic to read the
     %% current committed
     {Readers, TagMsgs} = maps:fold(
                            fun (Tag, Str0, {Acc, TM}) ->
-                                   {Str, Msgs} = stream_entries(Name, Leader, Str0),
+                                   {Str, Msgs} = stream_entries(Leader, Str0),
                                    %% HACK for now, better to just return but
                                    %% tricky with acks credits
                                    %% that also evaluate the stream
@@ -343,7 +375,23 @@ handle_event({osiris_offset, _From, _Offs}, State = #stream_client{leader = Lead
     Ack = true,
     Deliveries = [{deliver, Tag, Ack, OffsetMsg}
                   || {Tag, _LeaderPid, OffsetMsg} <- TagMsgs],
-    {ok, State#stream_client{readers = Readers}, Deliveries}.
+    {ok, State#stream_client{readers = Readers}, Deliveries};
+handle_event({osiris_chunk, _From, Tag, [FirstChunk | _] = Chunks},
+             State = #stream_client{leader = Leader,
+                                    readers = Readers0,
+                                    name = Name}) ->
+    #stream{pending_chunks = Chunks0,
+            listening_offset = NextOffset} = Str0 = maps:get(Tag, Readers0),
+    Str1 = case FirstChunk < NextOffset of
+               true -> reopen_log(Str0);
+               false -> Str0
+           end,
+    {ok, CRC} = osiris_server_sup:get_crc(Name),
+    {Str, Msgs} = stream_entries_by_chunks(CRC, Tag, Leader,
+                                           Str1#stream{pending_chunks = Chunks0 ++ Chunks}),
+    Readers = Readers0#{Tag => Str},
+    Deliver = [{deliver, Tag, true, Msgs}],
+    {ok, State#stream_client{readers = Readers}, Deliver}.
 
 is_recoverable(Q) ->
     Node = node(),
@@ -359,19 +407,23 @@ recover(_VHost, Queues) ->
       end, {[], []}, Queues).
 
 settle(complete, CTag, MsgIds, #stream_client{readers = Readers0,
-                                    name = Name,
-                                    leader = Leader} = State) ->
+                                              leader = Leader} = State) ->
     Credit = length(MsgIds),
     {Readers, Msgs} = case Readers0 of
+                          #{CTag := #stream{credit = Credit0,
+                                            competing = true} = Str0} ->
+                              Str1 = Str0#stream{credit = Credit0 + Credit},
+                              {Str, Msgs0} = stream_entries(Leader, Str1),
+                              {Readers0#{CTag => Str}, Msgs0};
                           #{CTag := #stream{credit = Credit0} = Str0} ->
                               Str1 = Str0#stream{credit = Credit0 + Credit},
-                              {Str, Msgs0} = stream_entries(Name, Leader, Str1),
+                              {Str, Msgs0} = stream_entries(Leader, Str1),
                               {Readers0#{CTag => Str}, Msgs0};
                           _ ->
                               {Readers0, []}
                       end,
     {State#stream_client{readers = Readers}, [{deliver, CTag, true, Msgs}]};
-settle(_, _, _, #stream_client{name = Name}) ->
+settle(_, _, _, #stream_client{reference = Name}) ->
     {protocol_error, not_implemented,
      "basic.nack and basic.reject not supported by stream queues ~s",
      [rabbit_misc:rs(Name)]}.
@@ -452,9 +504,11 @@ i(_, _) ->
 init(Q) when ?is_amqqueue(Q) ->
     Leader = amqqueue:get_pid(Q),
     {ok, SoftLimit} = application:get_env(rabbit, stream_messages_soft_limit),
-    #stream_client{name = amqqueue:get_name(Q),
+    Name = maps:get(name, amqqueue:get_type_state(Q)),
+    #stream_client{reference = amqqueue:get_name(Q),
                    leader = Leader,
-                   soft_limit = SoftLimit}.
+                   soft_limit = SoftLimit,
+                   name = Name}.
 
 close(#stream_client{readers = Readers}) ->
     _ = maps:map(fun (_, #stream{log = Log}) ->
@@ -639,10 +693,10 @@ check_queue_exists_in_local_node(Q) ->
 maybe_send_reply(_ChPid, undefined) -> ok;
 maybe_send_reply(ChPid, Msg) -> ok = rabbit_channel:send_command(ChPid, Msg).
 
-stream_entries(Name, Id, Str) ->
-    stream_entries(Name, Id, Str, []).
+stream_entries(Id, Str) ->
+    stream_entries(Id, Str, []).
 
-stream_entries(Name, LeaderPid,
+stream_entries(LeaderPid,
                #stream{name = QName,
                        credit = Credit,
                        start_offset = StartOffs,
@@ -665,7 +719,7 @@ stream_entries(Name, LeaderPid,
                         Msg0 = binary_to_msg(QName, B),
                         Msg = rabbit_basic:add_header(<<"x-stream-offset">>,
                                                       long, O, Msg0),
-                        {Name, LeaderPid, O, false, Msg}
+                        {QName, LeaderPid, O, false, Msg}
                     end || {O, B} <- Records,
                            O >= StartOffs],
 
@@ -680,11 +734,58 @@ stream_entries(Name, LeaderPid,
                 false ->
                     %% if there are fewer Msgs than Entries0 it means there were non-events
                     %% in the log and we should recurse and try again
-                    stream_entries(Name, LeaderPid, Str, MsgIn ++ Msgs)
+                    stream_entries(LeaderPid, Str, MsgIn ++ Msgs)
             end
     end;
-stream_entries(_Name, _Id, Str, Msgs) ->
+stream_entries(_Id, Str, Msgs) ->
     {Str, Msgs}.
+
+stream_entries_by_chunks(CRC, Tag, LeaderPid, Str) ->
+    stream_entries_by_chunks(CRC, Tag, LeaderPid, Str, []).
+
+stream_entries_by_chunks(_CRC, _Tag, _LeaderPid, #stream{pending_chunks = []} = Str, MsgIn) ->
+    {Str, MsgIn};
+stream_entries_by_chunks(CRC, Tag, LeaderPid,
+                         #stream{name = QName,
+                                 credit = Credit,
+                                 log = Seg0,
+                                 pending_chunks = [ChunkId | Chunks]} = Str0, MsgIn)
+  when Credit > 0 ->
+    case osiris_log:read_chunk_parsed(Seg0) of
+        {end_of_stream, Seg} ->
+            %% TODO where is my chunk? it might be older if other competing consumer just died
+            NextOffset = osiris_log:next_offset(Seg),
+            {Str0#stream{log = Seg,
+                         listening_offset = NextOffset}, MsgIn};
+        {[{Off, _} | _] = Records, Seg} when Off == ChunkId ->
+            Msgs = [begin
+                        Msg0 = binary_to_msg(QName, B),
+                        Msg = rabbit_basic:add_header(<<"x-stream-offset">>,
+                                                      long, O, Msg0),
+                        {QName, LeaderPid, O, false, Msg}
+                    end || {O, B} <- Records],
+            
+            NumMsgs = length(Msgs),
+            NextOffset = osiris_log:next_offset(Seg),
+            Str = Str0#stream{credit = Credit - NumMsgs,
+                              log = Seg,
+                              pending_chunks = Chunks,
+                              listening_offset = NextOffset},
+            %% Should we confirm when we get the ack from the consumers?
+            gen_server:cast(CRC, {ack, {self(), Tag}, ChunkId}),
+            case Str#stream.credit < 1 of
+                true ->
+                    %% we are done here
+                    {Str, MsgIn ++ Msgs};
+                false ->
+                    stream_entries_by_chunks(CRC, Tag, LeaderPid, Str, MsgIn ++ Msgs)
+            end;
+        {_, Seg} ->
+            %% Not yet the expected chunk, try again
+            stream_entries_by_chunks(CRC, Tag, LeaderPid, Str0#stream{log = Seg}, MsgIn)
+    end;
+stream_entries_by_chunks(_CRC, _Tag, _Id, Str, MsgIn) ->
+    {Str, MsgIn}.
 
 binary_to_msg(#resource{virtual_host = VHost,
                         kind = queue,
@@ -732,3 +833,14 @@ capabilities() ->
                           <<"x-initial-cluster-size">>, <<"x-queue-leader-locator">>],
       consumer_arguments => [<<"x-stream-offset">>],
       server_named => false}.
+
+reopen_log(#stream_client{readers = Readers0,
+                          name = QName} = Str0) ->
+    Q = rabbit_amqqueue:lookup(QName),
+    Conf = amqqueue:get_type_state(Q),
+    LocalPid = get_local_pid(Conf),
+    {ok, Seg0} = osiris:init_reader(LocalPid, 'first'),
+    NextOffset = osiris_log:next_offset(Seg0) - 1,
+    Str = Str0#stream{start_offset = NextOffset,
+                      listening_offset = NextOffset,
+                      log = Seg0}.
