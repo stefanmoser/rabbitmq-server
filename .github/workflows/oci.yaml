@@ -63,7 +63,7 @@ jobs:
             image_tag_suffix: '-otp-max'
     steps:
       - name: Checkout
-        uses: actions/checkout@v2.3.4
+        uses: actions/checkout@v2.3.5
 
       - name: Set up Erlang & Elixir
         uses: erlef/setup-beam@v1.8
